@@ -6,6 +6,7 @@ const {
   AccountCreateTransaction,
   TokenAssociateTransaction,
   TransferTransaction,
+  ContractId,
   AccountBalanceQuery,
   Hbar,
   TokenId,
@@ -16,6 +17,8 @@ const twilio = require('twilio');
 const express = require('express');
 const axios = require('axios');
 const logger = require('./logger');
+const multer = require('multer');
+const path = require('path');
 const { MongoClient } = require('mongodb');
 const cors = require('cors'); 
 const { v4: uuidv4 } = require('uuid');
@@ -36,6 +39,17 @@ const accountId = process.env.HEDERA_ACCOUNT_ID;
 const privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
 const client = (process.env.NODE_ENV === 'production' ? Client.forMainnet() : Client.forTestnet())
   .setOperator(accountId, privateKey);
+
+logger.info(`Client initialized with operator: ${accountId}`);
+if (!accountId || !accountId.startsWith('0.0.')) {
+throw new Error(`Invalid HEDERA_ACCOUNT_ID: ${accountId}`);
+}
+if (!privateKey) {
+throw new Error('HEDERA_PRIVATE_KEY is invalid or missing');
+}
+
+logger.info(`Client network: ${(process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet')}, operator: ${client.operatorAccountId?.toString()}`);
+
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const app = express();
 const port = process.env.PORT || 3000;
@@ -103,6 +117,37 @@ async function getMpesaToken() {
     throw error;
   }
 }
+
+const requireAuth = async (req, res, next) => {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  
+    const rider = await db.collection('riders').findOne({ phone });
+    if (!rider || !rider.accountId) {
+      return res.status(401).json({ error: 'Unauthorized: Rider not registered' });
+    }
+    req.rider = rider; // Attach rider to request for downstream use
+    next();
+  };
+  
+  // Helper function to validate policy creation inputs
+  const validatePolicyInputs = (phone, plan, protectionType, premiumHbar) => {
+    const phoneRegex = /^\+254\d{9}$/;
+    if (!phoneRegex.test(phone)) {
+      throw new Error('Invalid phone number format. Expected: +254xxxxxxxxx');
+    }
+    if (!['Daily', 'Weekly', 'Monthly'].includes(plan)) {
+      throw new Error('Invalid plan. Must be Daily, Weekly, or Monthly');
+    }
+    if (!['rider', 'bike'].includes(protectionType)) {
+      throw new Error('Invalid protection type. Must be "rider" or "bike"');
+    }
+    const premium = parseFloat(premiumHbar);
+    if (isNaN(premium) || premium <= 0) {
+      throw new Error('Invalid premiumHbar. Must be a positive number');
+    }
+    return premium;
+  };
 
 // Mock KSh to HBAR conversion
 async function convertKshToHbar(amountKsh) {
@@ -270,57 +315,95 @@ async function payPremiumOnChain(phone, amountKsh) {
 
 async function issuePolicyOnChain(riderAccountId, premiumHbar) {
     const contractExecTx = new ContractExecuteTransaction()
-      .setContractId(contractId)
+      .setContractId(ContractId.fromString(process.env.CLAIMS_CONTRACT_ID))
       .setGas(100000)
-      .setFunction("issuePolicy", new ContractFunctionParameters()
-        .addAddress(riderAccountId)
-        .addUint256(premiumHbar * 1e8))
+      .setFunction(
+        'issuePolicy',
+        new ContractFunctionParameters()
+          .addAddress(AccountId.fromString(riderAccountId).toSolidityAddress())
+          .addUint256(Math.floor(premiumHbar * 1e8)) // Convert HBAR to tinybars
+      )
       .setPayableAmount(new Hbar(premiumHbar));
   
     const contractExecSubmit = await contractExecTx.execute(client);
     const receipt = await contractExecSubmit.getReceipt(client);
   
-    if (receipt.status.toString() !== "SUCCESS") {
-      throw new Error("Policy issuance failed on chain");
+    if (receipt.status.toString() !== 'SUCCESS') {
+      throw new Error(`Policy issuance failed on chain: ${receipt.status.toString()}`);
     }
   
-    // Get the transaction ID
     const transactionId = contractExecSubmit.transactionId.toString();
-  
     logger.info(`Policy issued for ${riderAccountId} with ${premiumHbar} HBAR: ${transactionId}`);
-    return transactionId; // Return the transaction ID
+    return transactionId;
   }
 
   async function triggerPayout(phone) {
     const rider = await db.collection('riders').findOne({ phone });
     if (!rider) throw new Error('Rider not registered');
   
-    // Convert Hedera Account ID to Ethereum-compatible address
+    // Convert Hedera Account ID to EVM address
     const hederaAccountId = AccountId.fromString(rider.accountId);
-    const evmAddress = hederaAccountId.toEvmAddress(); // Converts to 40-character hex string (without 0x prefix)
+    let evmAddress;
+    try {
+      evmAddress = hederaAccountId.toEvmAddress();
+    } catch (e) {
+      const accountNumber = hederaAccountId.num.toString(16);
+      evmAddress = accountNumber.padStart(40, '0');
+      logger.warn(`Falling back to manual EVM address conversion for ${rider.accountId}: ${evmAddress}`);
+    }
+    const formattedAddress = `0x${evmAddress}`;
   
-    // Ensure the address is prefixed with '0x' if required by the contract
-    const formattedAddress = evmAddress.startsWith('0x') ? evmAddress : `0x${evmAddress}`;
-  
-    // Verify the address length (should be 42 characters with '0x')
     if (formattedAddress.length !== 42) {
       throw new Error(`Invalid EVM address length: ${formattedAddress} (expected 42 characters)`);
     }
   
-    const tx = await new ContractExecuteTransaction()
-      .setContractId(claimsContractId)
-      .setGas(100000)
-      .setFunction("triggerPayout", new ContractFunctionParameters().addAddress(formattedAddress))
+    // Check contract balance
+    const contractBalance = await new AccountBalanceQuery()
+      .setAccountId(ContractId.fromString(claimsContractId))
       .execute(client);
+    const balanceInHbar = contractBalance.hbars.toBigNumber().toNumber();
+    logger.info(`Contract balance: ${balanceInHbar} HBAR`);
+    if (balanceInHbar < 50) {
+      logger.warn(`Insufficient contract balance: ${balanceInHbar} HBAR (required: 50 HBAR)`);
+      const fundTx = await new TransferTransaction()
+        .addHbarTransfer(accountId, new Hbar(-50))
+        .addHbarTransfer(claimsContractId, new Hbar(50))
+        .execute(client);
+      await fundTx.getReceipt(client);
+      logger.info(`Funded contract ${claimsContractId} with 50 HBAR`);
+    }
   
-    const receipt = await tx.getReceipt(client);
-    logger.info(`Payout of 50 HBAR triggered to ${rider.accountId} (EVM: ${formattedAddress}) for ${phone}`);
+    // Execute the contract call
+    try {
+      const tx = new ContractExecuteTransaction()
+        .setContractId(claimsContractId)
+        .setGas(200000) // Increased gas limit
+        .setFunction("triggerPayout", new ContractFunctionParameters().addAddress(formattedAddress));
   
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: `whatsapp:${phone}`,
-      body: `Claim approved! 50 HBAR sent to your wallet: ${rider.accountId}`,
-    });
+      const txResponse = await tx.execute(client);
+      const receipt = await txResponse.getReceipt(client);
+  
+      if (receipt.status.toString() !== 'SUCCESS') {
+        throw new Error(`Contract execution reverted with status: ${receipt.status.toString()}`);
+      }
+  
+      const record = await txResponse.getRecord(client);
+      const contractResult = record.contractFunctionResult;
+      if (contractResult) {
+        logger.info(`Contract result: ${contractResult.toString()}`);
+      }
+  
+      logger.info(`Payout of 50 HBAR triggered to ${rider.accountId} (EVM: ${formattedAddress}) for ${phone}`);
+  
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_WHATSAPP_NUMBER,
+        to: `whatsapp:${phone}`,
+        body: `Claim approved! 50 HBAR sent to your wallet: ${rider.accountId}`,
+      });
+    } catch (error) {
+      logger.error(`Contract execution failed for ${phone}: ${error.message}`);
+      throw error;
+    }
   }
 
 // M-Pesa STK Push
@@ -512,53 +595,135 @@ app.post('/register-complete', async (req, res) => {
     }
 });
 
-app.post('/policies', async (req, res) => {
-    const { phone, page = 1, limit = 5 } = req.body;
-    
-    try {
-      const rider = await db.collection('riders').findOne({ phone });
-      if (!rider) {
-        return res.status(404).json({ 
-          error: 'Rider not found',
-          policies: [],
-          pagination: { totalPages: 0 }
-        });
-      }
+app.post('/policies', requireAuth, async (req, res) => {
+    const { phone, plan, protectionType, premiumHbar, page = 1, limit = 10 } = req.body;
+    const rider = req.rider; // From requireAuth middleware
   
-      const totalPolicies = await db.collection('policies')
-        .countDocuments({ riderAccountId: rider.accountId });
+    // Policy creation flow
+    if (plan && protectionType && premiumHbar) {
+      try {
+        // Step 1: Validate inputs
+        const validatedPremiumHbar = validatePolicyInputs(phone, plan, protectionType, premiumHbar);
   
-      const policies = await db.collection('policies')
-        .find({ riderAccountId: rider.accountId })
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .toArray();
-  
-      res.json({
-        policies: policies.map(p => ({
-          active: new Date(p.expiryDate) > new Date(),
-          premiumPaid: p.premium,
-          lastPayment: p.createdAt,
-          expiryDate: p.expiryDate,
-          transactionId: p.transactionId,
-          plan: p.plan
-        })),
-        pagination: {
-          currentPage: page,
-          totalPages: Math.ceil(totalPolicies / limit),
-          totalPolicies
+        // Step 2: Check rider's HBAR balance
+        const accountInfo = await new AccountBalanceQuery()
+          .setAccountId(rider.accountId)
+          .execute(client);
+        const hbarBalance = accountInfo.hbars.toBigNumber().toNumber();
+        const feeBuffer = 0.5; // Reserve for network fees
+        if (hbarBalance < validatedPremiumHbar + feeBuffer) {
+          logger.warn(`Insufficient HBAR balance for ${phone}: Available=${hbarBalance}, Needed=${validatedPremiumHbar + feeBuffer}`);
+          return res.status(400).json({ error: `Insufficient HBAR balance. Available: ${hbarBalance}, Needed: ${validatedPremiumHbar + feeBuffer}` });
         }
-      });
-    } catch (error) {
-      logger.error(`Policy fetch failed: ${error.message}`);
-      res.status(500).json({ 
-        error: 'Failed to fetch policies',
-        policies: [],
-        pagination: { totalPages: 0 }
-      });
+  
+        // Step 3: Transfer HBAR from rider to operator (payment)
+        const riderPrivateKey = PrivateKey.fromString(rider.privateKey);
+        const paymentTx = await new TransferTransaction()
+          .addHbarTransfer(rider.accountId, new Hbar(-validatedPremiumHbar))
+          .addHbarTransfer(accountId, new Hbar(validatedPremiumHbar))
+          .freezeWith(client)
+          .sign(riderPrivateKey);
+        const paymentResponse = await paymentTx.execute(client);
+        const paymentReceipt = await paymentResponse.getReceipt(client);
+        if (paymentReceipt.status.toString() !== 'SUCCESS') {
+          throw new Error(`HBAR payment failed: ${paymentReceipt.status.toString()}`);
+        }
+        const paymentTransactionId = paymentResponse.transactionId.toString();
+        logger.info(`HBAR payment successful for ${phone}: ${validatedPremiumHbar} HBAR, TxID: ${paymentTransactionId}`);
+  
+        // Step 4: Issue policy on-chain (only if payment succeeds)
+        const contractId = ContractId.fromString(process.env.CLAIMS_CONTRACT_ID); // Use your contract ID
+        const transactionId = await issuePolicyOnChain(rider.accountId, validatedPremiumHbar);
+        logger.info(`Policy issued on-chain for ${phone}: TxID ${transactionId}`);
+  
+        // Step 5: Create policy in MongoDB (only if on-chain succeeds)
+        const expiryMs = plan === 'Daily' ? 86400000 : plan === 'Weekly' ? 604800000 : 2592000000;
+        const policy = {
+          riderPhone: phone,
+          riderAccountId: rider.accountId,
+          plan,
+          protectionType,
+          hbarAmount: validatedPremiumHbar,
+          paymentMethod: 'hbar',
+          transactionId, // On-chain transaction ID
+          paymentTransactionId, // Payment transaction ID
+          createdAt: new Date().toISOString(),
+          expiryDate: new Date(Date.now() + expiryMs).toISOString(),
+          active: true,
+        };
+  
+        const result = await db.collection('policies').insertOne(policy);
+        logger.info(`Policy created in MongoDB for ${phone}: ${result.insertedId}`);
+  
+        // Step 6: Notify rider
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_WHATSAPP_NUMBER,
+          to: `whatsapp:${phone}`,
+          body: `Your ${plan} ${protectionType === 'rider' ? 'Rider' : 'Bike'} Protection policy is active! Paid ${validatedPremiumHbar} HBAR. Expires: ${new Date(policy.expiryDate).toLocaleDateString()}. TxID: ${transactionId}`,
+        });
+  
+        res.status(201).json({
+          message: `Policy ${plan} ${protectionType === 'rider' ? 'Rider' : 'Bike'} Protection created`,
+          policyId: result.insertedId.toString(),
+          transactionId,
+          paymentTransactionId,
+        });
+      } catch (error) {
+        logger.error(`Policy creation failed for ${phone}: ${error.message}`);
+        if (error.message.includes('Insufficient HBAR')) {
+          return res.status(400).json({ error: error.message });
+        }
+        if (error.message.includes('Invalid')) {
+          return res.status(400).json({ error: error.message });
+        }
+        res.status(500).json({ error: `Failed to create policy: ${error.message}` });
+      }
     }
-  });
+    // Policy fetch flow
+    else if (phone) {
+      try {
+        const pageNum = parseInt(page, 10);
+        const limitNum = parseInt(limit, 10);
+        if (pageNum < 1 || limitNum < 1 || limitNum > 100) {
+          return res.status(400).json({ error: 'Invalid page or limit. Page >= 1, Limit 1-100' });
+        }
+  
+        const totalPolicies = await db.collection('policies').countDocuments({ riderPhone: phone });
+        const policies = await db.collection('policies')
+          .find({ riderPhone: phone })
+          .sort({ createdAt: -1 })
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .toArray();
+  
+        const formattedPolicies = policies.map((p) => ({
+          _id: p._id.toString(),
+          plan: p.plan,
+          protectionType: p.protectionType,
+          hbarAmount: p.hbarAmount,
+          createdAt: p.createdAt,
+          expiryDate: p.expiryDate,
+          active: new Date(p.expiryDate) > new Date(),
+          transactionId: p.transactionId,
+          paymentTransactionId: p.paymentTransactionId,
+        }));
+  
+        res.status(200).json({
+          policies: formattedPolicies,
+          pagination: {
+            currentPage: pageNum,
+            totalPages: Math.ceil(totalPolicies / limitNum),
+            totalPolicies,
+          },
+        });
+      } catch (error) {
+        logger.error(`Policy fetch failed for ${phone}: ${error.message}`);
+        res.status(500).json({ error: 'Failed to fetch policies' });
+      }
+    } else {
+      res.status(400).json({ error: 'Phone number required' });
+    }
+});
 
 // Remove the convertKshToHbar function since we won't need it
 // async function convertKshToHbar(amountKsh) { ... } // Removed
@@ -629,66 +794,43 @@ async function payPremiumWithHbar(phone, hbarAmount, plan) {
   
   // Update /paypremium endpoint
   app.post('/paypremium', async (req, res) => {
-    const { phone, amount, plan, paymentMethod } = req.body;
-    
-    if (!phone || !amount || !plan) {
-      return res.status(400).json({ error: 'Phone, amount, and plan are required' });
+    const { phone, policies, totalAmount, paymentMethod } = req.body;
+  
+    if (!phone || !policies || !totalAmount || !paymentMethod) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
   
     try {
-      if (paymentMethod === 'hbar') {
-        const hbarAmount = parseFloat(amount); // Amount is now in HBAR
-        const result = await payPremiumWithHbar(phone, hbarAmount, plan);
-        res.json({ 
-          success: true,
-          transactionId: result.transactionId,
-          message: 'HBAR payment processed successfully'
-        });
-      } else {
-        // M-Pesa payment (still in KSh)
-        const amountKsh = parseFloat(amount);
-        const token = await getMpesaToken();
-        const timestamp = new Date().toISOString().replace(/[-:.T]/g, '').slice(0, 14);
-        const password = Buffer.from(`${mpesaShortcode}${mpesaPasskey}${timestamp}`).toString('base64');
-        const checkoutRequestId = `BODA-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      if (paymentMethod === 'mpesa') {
+        // Handle M-Pesa payment for totalAmount
+        const checkoutRequestId = await initiateMpesaPayment(phone, totalAmount);
+        res.json({ checkoutRequestId });
+      } else if (paymentMethod === 'hbar') {
+        const rider = await db.collection('riders').findOne({ phone });
+        if (!rider) return res.status(404).json({ error: 'Rider not found' });
   
-        await db.collection('pending_payments').insertOne({
-          checkoutRequestId,
-          phone,
-          amountKsh,
-          plan,
-          createdAt: new Date(),
-          status: 'pending'
-        });
-  
-        const response = await axios.post(
-          `${mpesaBaseUrl}/mpesa/stkpush/v1/processrequest`,
-          {
-            BusinessShortCode: mpesaShortcode,
-            Password: password,
-            Timestamp: timestamp,
-            TransactionType: 'CustomerPayBillOnline',
-            Amount: Math.floor(amountKsh),
-            PartyA: phone.replace('+', ''),
-            PartyB: mpesaShortcode,
-            PhoneNumber: phone.replace('+', ''),
-            CallBackURL: callbackUrl,
-            AccountReference: `BODA-${plan}`,
-            TransactionDesc: `BodaBoda ${plan} Plan`,
-            CheckoutRequestID: checkoutRequestId
-          },
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-  
-        res.json({ 
-          success: true,
-          checkoutRequestId,
-          ...response.data 
-        });
+        // Process each policy
+        for (const policy of policies) {
+          const { plan, protectionType, amount } = policy;
+          const transactionId = await issuePolicyOnChain(rider.accountId, amount);
+          const expiryMs = plan === 'Daily' ? 86400000 : plan === 'Weekly' ? 604800000 : 2592000000;
+          await db.collection('policies').insertOne({
+            riderPhone: phone,
+            riderAccountId: rider.accountId,
+            plan,
+            protectionType,
+            hbarAmount: amount,
+            paymentMethod: 'hbar',
+            transactionId,
+            createdAt: new Date().toISOString(),
+            expiryDate: new Date(Date.now() + expiryMs).toISOString(),
+            active: true,
+          });
+        }
+        res.json({ success: true });
       }
     } catch (error) {
-      logger.error(`Payment initiation failed: ${error.message}`);
-      res.status(500).json({ error: error.message || 'Payment initiation failed' });
+      res.status(500).json({ error: error.message });
     }
   });
 
@@ -742,29 +884,75 @@ async function payPremiumWithHbar(phone, hbarAmount, plan) {
       logger.error(`Callback processing failed: ${error.message}`);
       res.status(500).json({ error: 'Callback processing failed' });
     }
-  });
+});
 
-app.post('/claim', async (req, res) => {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone number required' });
-    const rider = await db.collection('riders').findOne({ phone });
-    if (!rider || !rider.accountId) return res.status(400).json({ error: 'Rider not registered' });
+const storage = multer.diskStorage({
+    destination: './uploads/claims', // Create this folder in your project
+    filename: (req, file, cb) => {
+      cb(null, `${Date.now()}-${file.originalname}`);
+    },
+  });
+  const upload = multer({
+    storage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    fileFilter: (req, file, cb) => {
+      const filetypes = /jpeg|jpg|png/;
+      const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+      const mimetype = filetypes.test(file.mimetype);
+      if (extname && mimetype) {
+        return cb(null, true);
+      }
+      cb(new Error('Only JPEG/PNG images are allowed'));
+    },
+});
+
+app.use('/uploads/claims', express.static(path.join(__dirname, 'uploads/claims')));
+
+app.post('/claims', async (req, res) => {
+  const { phone } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'Phone number required' });
+  }
+
+  try {
+    const claims = await db.collection('claims').find({ phone }).toArray();
+    res.json({ claims });
+  } catch (error) {
+    logger.error(`Failed to fetch claims for ${phone}: ${error.message}`);
+    res.status(500).json({ error: 'Failed to fetch claims' });
+  }
+});
+
+app.post('/claim', upload.single('image'), async (req, res) => {
+    const { phone, policyId, details } = req.body;
+    const image = req.file;
+  
+    if (!phone || !policyId || !details || !image) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
   
     try {
-      await db.collection('claims').insertOne({
-        riderAccountId: rider.accountId,
-        phone,
+      const policy = await db.collection('policies').findOne({ _id: policyId, riderPhone: phone });
+      if (!policy || !policy.active || new Date(policy.expiryDate) < new Date()) {
+        return res.status(400).json({ error: 'Invalid or inactive policy' });
+      }
+  
+      const claim = {
+        policy: policy._id,
+        premium: policy.hbarAmount || policy.premiumPaid / 12.9,
+        effectiveDate: policy.createdAt,
         status: 'Pending',
-        effectiveDate: new Date().toISOString().split('T')[0],
-        premium: 786.99,
-        policy: "Karisa's Apple Juju",
-        createdAt: new Date(),
-      });
-      await triggerPayout(phone);
-      res.json({ message: 'Payout triggered successfully' });
+        claimId: generateClaimId(), // Your ID generation logic
+        createdAt: new Date().toISOString(),
+        details,
+        imageUrl: `/uploads/${image.filename}`
+      };
+  
+      await db.collection('claims').insertOne(claim);
+      res.json({ message: 'Claim submitted successfully' });
     } catch (error) {
-      logger.error(`Payout failed for ${phone}: ${error.message}`);
-      res.status(500).json({ error: error.message || 'Payout failed' });
+      res.status(500).json({ error: error.message });
     }
   });
 
