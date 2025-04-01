@@ -2,6 +2,7 @@ require('dotenv').config();
 const {
   Client,
   PrivateKey,
+  AccountId,
   AccountCreateTransaction,
   TokenAssociateTransaction,
   TransferTransaction,
@@ -290,24 +291,37 @@ async function issuePolicyOnChain(riderAccountId, premiumHbar) {
     return transactionId; // Return the transaction ID
   }
 
-async function triggerPayout(phone) {
-  const rider = await db.collection('riders').findOne({ phone });
-  if (!rider) throw new Error('Rider not registered');
-
-  const tx = await new ContractExecuteTransaction()
-    .setContractId(claimsContractId)
-    .setGas(100000)
-    .setFunction("triggerPayout", new ContractFunctionParameters().addAddress(rider.accountId))
-    .execute(client);
-  const receipt = await tx.getReceipt(client);
-  logger.info(`Payout of 50 HBAR triggered to ${rider.accountId} for ${phone}`);
-
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_NUMBER,
-    to: `whatsapp:${phone}`,
-    body: `Claim approved! 50 HBAR sent to your wallet: ${rider.accountId}`,
-  });
-}
+  async function triggerPayout(phone) {
+    const rider = await db.collection('riders').findOne({ phone });
+    if (!rider) throw new Error('Rider not registered');
+  
+    // Convert Hedera Account ID to Ethereum-compatible address
+    const hederaAccountId = AccountId.fromString(rider.accountId);
+    const evmAddress = hederaAccountId.toEvmAddress(); // Converts to 40-character hex string (without 0x prefix)
+  
+    // Ensure the address is prefixed with '0x' if required by the contract
+    const formattedAddress = evmAddress.startsWith('0x') ? evmAddress : `0x${evmAddress}`;
+  
+    // Verify the address length (should be 42 characters with '0x')
+    if (formattedAddress.length !== 42) {
+      throw new Error(`Invalid EVM address length: ${formattedAddress} (expected 42 characters)`);
+    }
+  
+    const tx = await new ContractExecuteTransaction()
+      .setContractId(claimsContractId)
+      .setGas(100000)
+      .setFunction("triggerPayout", new ContractFunctionParameters().addAddress(formattedAddress))
+      .execute(client);
+  
+    const receipt = await tx.getReceipt(client);
+    logger.info(`Payout of 50 HBAR triggered to ${rider.accountId} (EVM: ${formattedAddress}) for ${phone}`);
+  
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      to: `whatsapp:${phone}`,
+      body: `Claim approved! 50 HBAR sent to your wallet: ${rider.accountId}`,
+    });
+  }
 
 // M-Pesa STK Push
 async function initiateMpesaPayment(phone, amountKsh, purpose) {
@@ -737,24 +751,22 @@ app.post('/claim', async (req, res) => {
     if (!rider || !rider.accountId) return res.status(400).json({ error: 'Rider not registered' });
   
     try {
-      // Store the claim in MongoDB
       await db.collection('claims').insertOne({
         riderAccountId: rider.accountId,
         phone,
         status: 'Pending',
         effectiveDate: new Date().toISOString().split('T')[0],
-        premium: 786.99, // Replace with actual premium amount
-        policy: "Karisa's Apple Juju", // Replace with actual policy name
+        premium: 786.99,
+        policy: "Karisa's Apple Juju",
         createdAt: new Date(),
       });
-  
       await triggerPayout(phone);
       res.json({ message: 'Payout triggered successfully' });
     } catch (error) {
       logger.error(`Payout failed for ${phone}: ${error.message}`);
-      res.status(500).json({ error: 'Payout failed' });
+      res.status(500).json({ error: error.message || 'Payout failed' });
     }
-});
+  });
 
 app.post('/user-status', async (req, res) => {
     const { phone } = req.body;

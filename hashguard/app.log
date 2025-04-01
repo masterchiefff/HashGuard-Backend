@@ -359,3 +359,16 @@
 2025-04-01T03:18:43.177Z [info]: Payment attempt for +254710865696: Balance=97.7 HBAR, Required=1.55 HBAR, Fees=0.1 HBAR
 2025-04-01T03:18:46.676Z [info]: HBAR payment processed for +254710865696: 1.55 HBAR for Daily plan
 2025-04-01T03:18:48.271Z [info]: Wallet balance for +254710865696: 9615000000 tinybars, 96.15 HBAR, 0 HPT
+2025-04-01T03:39:31.961Z [info]: Wallet balance for +254710865696: 9615000000 tinybars, 96.15 HBAR, 0 HPT
+2025-04-01T03:39:32.142Z [info]: Wallet balance for +254710865696: 9615000000 tinybars, 96.15 HBAR, 0 HPT
+2025-04-01T03:43:31.109Z [error]: Payout failed for +254710865696: `address` type requires parameter to be 40 or 42 characters
+2025-04-01T03:43:49.428Z [info]: Connected to MongoDB Atlas
+2025-04-01T03:43:49.449Z [info]: Server running on port 5300 in development mode (Hedera Testnet)
+2025-04-01T03:43:57.184Z [error]: Payout failed for +254710865696: `address` type requires parameter to be 40 or 42 characters
+2025-04-01T03:47:02.994Z [info]: Connected to MongoDB Atlas
+2025-04-01T03:47:03.020Z [info]: Server running on port 5300 in development mode (Hedera Testnet)
+2025-04-01T03:47:26.133Z [info]: Connected to MongoDB Atlas
+2025-04-01T03:47:26.142Z [info]: Server running on port 5300 in development mode (Hedera Testnet)
+2025-04-01T03:48:07.016Z [info]: Connected to MongoDB Atlas
+2025-04-01T03:48:07.024Z [info]: Server running on port 5300 in development mode (Hedera Testnet)
+2025-04-01T03:50:08.750Z [error]: Payout failed for +254710865696: hederaAccountId.toEvmAddress is not a function
