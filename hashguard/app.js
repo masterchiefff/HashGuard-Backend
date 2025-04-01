@@ -455,6 +455,8 @@ app.post('/register', async (req, res) => {
         to: `whatsapp:${phone}`,
         body: `Your HashGuard OTP is ${otp}. Reply with this to verify.`,
       });
+      
+      console.log(otp)
   
       await db.collection('otps').updateOne(
         { phone },
