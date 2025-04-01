@@ -882,66 +882,45 @@ app.post('/paypremium', async (req, res) => {
   });
 
   app.post('/get-claims', async (req, res) => {
-    try {
-        const { phone } = req.body;
-        
-        // Validate phone number input
-        if (!phone) {
-            return res.status(400).json({ 
-                error: 'Phone number is required' 
-            });
-        }
-
-        // Verify rider exists
-        const rider = await db.collection('riders').findOne({ phone });
-        if (!rider) {
-            return res.status(404).json({ 
-                error: 'Rider not found' 
-            });
-        }
-
-        console.log(rider)
-
-        // Fetch all claims for the rider
-        const claims = await db.collection('claims')
-            .find({ riderPhone: phone })
-            .sort({ createdAt: -1 }) // Sort by newest first
-            .toArray();
-
-            console.log(claims)
-
-        // Format the claims data
-        const formattedClaims = claims.map(claim => ({
-            claimId: claim.claimId,
-            policyId: claim.policy?.toString(),
-            status: claim.status,
-            premium: claim.premium,
-            effectiveDate: claim.effectiveDate,
-            createdAt: claim.createdAt,
-            details: claim.details,
-            imageUrl: claim.imageUrl,
-            _id: claim._id.toString()
-        }));
-
-        // Return successful response
-        res.status(200).json({
-            success: true,
-            claims: formattedClaims,
-            total: formattedClaims.length,
-            message: formattedClaims.length > 0 
-                ? 'Claims retrieved successfully' 
-                : 'No claims found for this rider'
-        });
-
-    } catch (error) {
-        logger.error(`Failed to fetch claims for phone ${req.body.phone}: ${error.message}`);
-        res.status(500).json({ 
-            success: false,
-            error: 'Failed to retrieve claims',
-            details: error.message 
-        });
+    const { phone } = req.body;
+  
+    // Validate input
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
     }
-});
+  
+    try {
+      // Fetch claims from the claims collection
+      const claims = await db.collection('claims')
+        .find({ riderPhone: phone })
+        .sort({ createdAt: -1 }) // Sort by creation date, newest first
+        .toArray();
+  
+      // Return the claims data
+      res.json({
+        success: true,
+        claims: claims.map(claim => ({
+          _id: claim._id.toString(),
+          claimId: claim.claimId,
+          policy: claim.policy.toString(), // Convert ObjectId to string
+          premium: claim.premium,
+          effectiveDate: claim.effectiveDate,
+          status: claim.status,
+          createdAt: claim.createdAt,
+          details: claim.details,
+          imageUrl: claim.imageUrl,
+          // Include additional fields if they exist
+          claimAmount: claim.claimAmount || null,
+          paymentTransactionId: claim.paymentTransactionId || null,
+          transactionId: claim.transactionId || null,
+        })),
+        total: claims.length,
+      });
+    } catch (error) {
+      logger.error(`Failed to fetch claims for ${phone}: ${error.message}`);
+      res.status(500).json({ success: false, error: 'Failed to fetch claims' });
+    }
+  });
 
   app.post('/callback', async (req, res) => {
     const callbackData = req.body.Body.stkCallback;
@@ -1106,73 +1085,142 @@ app.post('/all-claims', async (req, res) => {
   });
 
   app.post('/claim', upload.single('image'), async (req, res) => {
-    const { phone, policyId, details } = req.body;
+    const { phone, policyId, details } = req.body; // claimAmount removed from required fields
     const image = req.file;
   
+    // Validate inputs
     if (!phone || !policyId || !details || !image) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Missing required fields (phone, policyId, details, image)' });
     }
   
     try {
-      // Verify rider exists
+      // Step 1: Verify rider exists
       const rider = await db.collection('riders').findOne({ phone });
       if (!rider) {
         return res.status(404).json({ error: 'Rider not found' });
       }
   
-      // Verify policy exists and is active
+      // Step 2: Verify policy exists and is active
       const policy = await db.collection('policies').findOne({ 
         _id: new ObjectId(policyId), 
         riderPhone: phone 
       });
-      if (!policy || !policy.active || new Date(policy.expiryDate) < new Date()) {
-        return res.status(400).json({ error: 'Invalid or inactive policy' });
+  
+      if (!policy) {
+        const activePolicies = await db.collection('policies')
+          .find({ 
+            riderPhone: phone,
+            active: true,
+            expiryDate: { $gt: new Date().toISOString() }
+          })
+          .toArray();
+  
+        if (activePolicies.length === 0) {
+          return res.status(400).json({ error: 'No active policies found. Please purchase a policy first.' });
+        }
+        return res.status(400).json({ error: 'Specified policy not found' });
       }
   
-      // Create initial claim document without transactionId
+      if (!policy.active || new Date(policy.expiryDate) < new Date()) {
+        return res.status(400).json({ error: 'Specified policy is inactive or expired' });
+      }
+  
+      // Step 3: Derive claim amount from policy
+      const claimAmountHbar = policy.hbarAmount || (policy.premiumPaid ? policy.premiumPaid / 12.9 : 0);
+      if (!claimAmountHbar || claimAmountHbar <= 0) {
+        return res.status(400).json({ error: 'Invalid claim amount derived from policy' });
+      }
+  
+      // Step 4: Check rider's HBAR balance
+      const accountInfo = await new AccountBalanceQuery()
+        .setAccountId(rider.accountId)
+        .execute(client);
+      const hbarBalance = accountInfo.hbars.toBigNumber().toNumber();
+      const feeBuffer = 0.1; // Reserve for network fees
+  
+      if (hbarBalance < claimAmountHbar + feeBuffer) {
+        logger.warn(`Insufficient HBAR balance for ${phone}: Available=${hbarBalance}, Needed=${claimAmountHbar + feeBuffer}`);
+        return res.status(400).json({ error: `Insufficient HBAR balance. Available: ${hbarBalance}, Needed: ${claimAmountHbar + feeBuffer}` });
+      }
+  
+      // Step 5: Deduct claim amount from rider to operator
+      const riderPrivateKey = PrivateKey.fromString(rider.privateKey);
+      const paymentTx = await new TransferTransaction()
+        .addHbarTransfer(rider.accountId, new Hbar(-claimAmountHbar)) // Deduct from rider
+        .addHbarTransfer(accountId, new Hbar(claimAmountHbar)) // Credit to operator
+        .freezeWith(client)
+        .sign(riderPrivateKey);
+      const paymentResponse = await paymentTx.execute(client);
+      const paymentReceipt = await paymentResponse.getReceipt(client);
+      if (paymentReceipt.status.toString() !== 'SUCCESS') {
+        throw new Error(`Payment deduction failed: ${paymentReceipt.status.toString()}`);
+      }
+      const paymentTransactionId = paymentResponse.transactionId.toString();
+      logger.info(`Claim payment deducted for ${phone}: ${claimAmountHbar} HBAR, TxID: ${paymentTransactionId}`);
+  
+      // Step 6: Create initial claim document
       const claim = {
         riderPhone: phone,
         policy: new ObjectId(policyId),
-        premium: policy.hbarAmount || (policy.premiumPaid ? policy.premiumPaid / 12.9 : 0),
+        premium: claimAmountHbar, // Use derived claim amount
         effectiveDate: policy.createdAt,
         status: 'Pending',
         claimId: generateClaimId(),
         createdAt: new Date().toISOString(),
         details,
-        imageUrl: `/uploads/claims/${image.filename}`
+        imageUrl: `/uploads/claims/${image.filename}`,
+        claimAmount: claimAmountHbar,
+        paymentTransactionId
       };
   
-      // Insert claim into database
+      // Step 7: Insert claim into database
       const result = await db.collection('claims').insertOne(claim);
       const claimId = result.insertedId;
   
-      // Perform Hedera transaction (example: transferring HBAR to rider as claim payout)
-      const transaction = new TransferTransaction()
-        .addHbarTransfer(accountId, -claim.premium) // Deduct from operator
-        .addHbarTransfer(AccountId.fromString(rider.accountId), claim.premium); // Add to rider
+      // Step 8: Perform payout transaction (operator to rider)
+      const payoutTx = new TransferTransaction()
+        .addHbarTransfer(accountId, new Hbar(-claimAmountHbar)) // Deduct from operator
+        .addHbarTransfer(AccountId.fromString(rider.accountId), new Hbar(claimAmountHbar)); // Add to rider
+      const payoutResponse = await payoutTx.execute(client);
+      const payoutReceipt = await payoutResponse.getReceipt(client);
+      const payoutTransactionId = payoutResponse.transactionId.toString();
   
-      // Execute transaction
-      const txResponse = await transaction.execute(client);
-      const receipt = await txResponse.getReceipt(client);
-      const transactionId = txResponse.transactionId.toString();
+      if (payoutReceipt.status.toString() !== 'SUCCESS') {
+        throw new Error(`Payout failed: ${payoutReceipt.status.toString()}`);
+      }
   
-      // Update claim with transactionId
+      // Step 9: Update claim with payout transaction ID
       await db.collection('claims').updateOne(
         { _id: claimId },
-        { $set: { transactionId } }
+        { $set: { transactionId: payoutTransactionId, status: 'Processed' } }
       );
   
+      // Step 10: Mark the policy as inactive after successful claim
+      await db.collection('policies').updateOne(
+        { _id: new ObjectId(policyId) },
+        { $set: { active: false, claimedAt: new Date().toISOString() } } // Optionally track when it was claimed
+      );
+  
+      // Step 11: Notify rider
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_WHATSAPP_NUMBER,
+        to: `whatsapp:${phone}`,
+        body: `Your claim (${claim.claimId}) for ${claimAmountHbar} HBAR has been processed! Payout TxID: ${payoutTransactionId}`,
+      });
+  
       res.json({ 
-        message: 'Claim submitted and transaction processed successfully',
+        message: 'Claim submitted, payment deducted, and payout processed successfully',
         claimId: claim.claimId,
         id: claimId.toString(),
-        transactionId
+        paymentTransactionId,
+        payoutTransactionId
       });
     } catch (error) {
       logger.error(`Claim submission failed for ${phone}: ${error.message}`);
       res.status(500).json({ error: error.message });
     }
   });
+
 
 app.post('/user-status', async (req, res) => {
     const { phone } = req.body;
