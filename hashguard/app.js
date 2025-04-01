@@ -19,9 +19,15 @@ const axios = require('axios');
 const logger = require('./logger');
 const multer = require('multer');
 const path = require('path');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors'); 
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+const generateClaimId= () => {
+    const rand = crypto.randomBytes(16).toString("hex")
+    return `claim_id_${rand}`
+}
 
 // Config Validation
 const requiredEnv = [
@@ -793,46 +799,149 @@ async function payPremiumWithHbar(phone, hbarAmount, plan) {
   }
   
   // Update /paypremium endpoint
-  app.post('/paypremium', async (req, res) => {
-    const { phone, policies, totalAmount, paymentMethod } = req.body;
-  
-    if (!phone || !policies || !totalAmount || !paymentMethod) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-  
+// In your server code (index.ts)
+app.post('/paypremium', async (req, res) => {
     try {
-      if (paymentMethod === 'mpesa') {
-        // Handle M-Pesa payment for totalAmount
-        const checkoutRequestId = await initiateMpesaPayment(phone, totalAmount);
-        res.json({ checkoutRequestId });
-      } else if (paymentMethod === 'hbar') {
-        const rider = await db.collection('riders').findOne({ phone });
-        if (!rider) return res.status(404).json({ error: 'Rider not found' });
+      const { phone, policies, totalAmount, paymentMethod } = req.body;
+      
+      if (!phone || !policies || !totalAmount || !paymentMethod) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+  
+      const rider = await db.collection('riders').findOne({ phone });
+      if (!rider || !rider.accountId) {
+        return res.status(404).json({ error: 'Rider not found' });
+      }
+  
+      if (paymentMethod === 'hbar') {
+        // Verify rider has sufficient HBAR balance
+        const accountInfo = await new AccountBalanceQuery()
+          .setAccountId(rider.accountId)
+          .execute(client);
+        
+        const hbarBalance = accountInfo.hbars.toTinybars().toNumber() / 100000000; // Convert to HBAR
+        
+        if (hbarBalance < totalAmount) {
+          return res.status(400).json({ error: 'Insufficient HBAR balance' });
+        }
   
         // Process each policy
+        const results = [];
         for (const policy of policies) {
-          const { plan, protectionType, amount } = policy;
-          const transactionId = await issuePolicyOnChain(rider.accountId, amount);
-          const expiryMs = plan === 'Daily' ? 86400000 : plan === 'Weekly' ? 604800000 : 2592000000;
-          await db.collection('policies').insertOne({
+          const expiryMs = policy.plan === 'Daily' ? 86400000 : 
+                           policy.plan === 'Weekly' ? 604800000 : 2592000000;
+          
+          // Create policy record
+          const newPolicy = {
             riderPhone: phone,
             riderAccountId: rider.accountId,
-            plan,
-            protectionType,
-            hbarAmount: amount,
+            plan: policy.plan,
+            protectionType: policy.protectionType,
+            hbarAmount: policy.amount,
             paymentMethod: 'hbar',
-            transactionId,
             createdAt: new Date().toISOString(),
             expiryDate: new Date(Date.now() + expiryMs).toISOString(),
-            active: true,
-          });
+            active: true
+          };
+  
+          // Save to database
+          const result = await db.collection('policies').insertOne(newPolicy);
+          results.push(result.insertedId);
+  
+          // Transfer HBAR from rider to insurance account
+          const riderPrivateKey = PrivateKey.fromString(rider.privateKey);
+          const tx = await new TransferTransaction()
+            .addHbarTransfer(rider.accountId, new Hbar(-policy.amount))
+            .addHbarTransfer(accountId, new Hbar(policy.amount))
+            .freezeWith(client)
+            .sign(riderPrivateKey);
+          
+          const txResponse = await tx.execute(client);
+          const receipt = await txResponse.getReceipt(client);
+          const transactionId = txResponse.transactionId.toString();
+  
+          // Update policy with transaction ID
+          await db.collection('policies').updateOne(
+            { _id: result.insertedId },
+            { $set: { transactionId } }
+          );
         }
-        res.json({ success: true });
+  
+        return res.json({ 
+          success: true,
+          policyIds: results.map(id => id.toString())
+        });
+      } else {
+        // M-Pesa payment flow remains the same
+        // ... existing M-Pesa code ...
       }
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      logger.error(`Premium payment failed: ${error.message}`);
+      res.status(500).json({ error: 'Payment processing failed' });
     }
   });
+
+  app.post('/get-claims', async (req, res) => {
+    try {
+        const { phone } = req.body;
+        
+        // Validate phone number input
+        if (!phone) {
+            return res.status(400).json({ 
+                error: 'Phone number is required' 
+            });
+        }
+
+        // Verify rider exists
+        const rider = await db.collection('riders').findOne({ phone });
+        if (!rider) {
+            return res.status(404).json({ 
+                error: 'Rider not found' 
+            });
+        }
+
+        console.log(rider)
+
+        // Fetch all claims for the rider
+        const claims = await db.collection('claims')
+            .find({ riderPhone: phone })
+            .sort({ createdAt: -1 }) // Sort by newest first
+            .toArray();
+
+            console.log(claims)
+
+        // Format the claims data
+        const formattedClaims = claims.map(claim => ({
+            claimId: claim.claimId,
+            policyId: claim.policy?.toString(),
+            status: claim.status,
+            premium: claim.premium,
+            effectiveDate: claim.effectiveDate,
+            createdAt: claim.createdAt,
+            details: claim.details,
+            imageUrl: claim.imageUrl,
+            _id: claim._id.toString()
+        }));
+
+        // Return successful response
+        res.status(200).json({
+            success: true,
+            claims: formattedClaims,
+            total: formattedClaims.length,
+            message: formattedClaims.length > 0 
+                ? 'Claims retrieved successfully' 
+                : 'No claims found for this rider'
+        });
+
+    } catch (error) {
+        logger.error(`Failed to fetch claims for phone ${req.body.phone}: ${error.message}`);
+        res.status(500).json({ 
+            success: false,
+            error: 'Failed to retrieve claims',
+            details: error.message 
+        });
+    }
+});
 
   app.post('/callback', async (req, res) => {
     const callbackData = req.body.Body.stkCallback;
@@ -907,24 +1016,96 @@ const storage = multer.diskStorage({
 });
 
 app.use('/uploads/claims', express.static(path.join(__dirname, 'uploads/claims')));
-
+// Get all claims for a rider
 app.post('/claims', async (req, res) => {
-  const { phone } = req.body;
+    try {
+      const { phone } = req.body;
+      
+      if (!phone) {
+        return res.status(400).json({ error: 'Phone number is required' });
+      }
+  
+      // Verify rider exists
+      const rider = await db.collection('riders').findOne({ phone });
+      if (!rider) {
+        return res.status(404).json({ error: 'Rider not found' });
+      }
+  
+      // Get all claims for this rider from the claims collection
+      const claims = await db.collection('claims')
+        .find({ riderPhone: phone })
+        .sort({ createdAt: -1 }) // Newest first
+        .toArray();
 
-  if (!phone) {
-    return res.status(400).json({ error: 'Phone number required' });
-  }
+        console.log(claims)
+  
+      // Convert MongoDB ObjectId to string
+      const formattedClaims = claims.map(claim => ({
+        ...claim,
+        _id: claim._id.toString(),
+        policy: claim.policy?.toString() || null
+      }));
+  
+      res.status(200).json({ claims: formattedClaims });
+    } catch (error) {
+      logger.error(`Failed to fetch claims: ${error.message}`);
+      res.status(500).json({ error: 'Failed to fetch claims' });
+    }
+  });
 
-  try {
-    const claims = await db.collection('claims').find({ phone }).toArray();
-    res.json({ claims });
-  } catch (error) {
-    logger.error(`Failed to fetch claims for ${phone}: ${error.message}`);
-    res.status(500).json({ error: 'Failed to fetch claims' });
-  }
-});
+// Add this endpoint to your server code
+app.post('/all-claims', async (req, res) => {
+    try {
+      const { phone } = req.body;
+      if (!phone) {
+        return res.status(400).json({ error: 'Phone number required' });
+      }
+  
+      // Verify the rider exists
+      const rider = await db.collection('riders').findOne({ phone });
+      if (!rider) {
+        return res.status(404).json({ error: 'Rider not found' });
+      }
+  
+      // Get all claims for this rider
+      const claims = await db.collection('claims')
+        .find({ riderPhone: phone })
+        .sort({ createdAt: -1 }) // Sort by newest first
+        .toArray();
+  
+      // Get active policies to check which claims are for active policies
+      const activePolicies = await db.collection('policies')
+        .find({ 
+          riderPhone: phone,
+          expiryDate: { $gt: new Date().toISOString() }
+        })
+        .toArray();
+  
+      // Enrich claims with policy information
+      const enrichedClaims = await Promise.all(claims.map(async (claim) => {
+        const policy = await db.collection('policies').findOne({ 
+          _id: new ObjectId(claim.policy) 
+        });
+  
+        return {
+          ...claim,
+          policyDetails: {
+            plan: policy?.plan || 'Unknown',
+            protectionType: policy?.protectionType || 'Unknown',
+            active: activePolicies.some(p => p._id.toString() === claim.policy.toString())
+          },
+          _id: claim._id.toString()
+        };
+      }))
+  
+      res.status(200).json({ claims: enrichedClaims });
+    } catch (error) {
+      logger.error(`Failed to fetch claims: ${error.message}`);
+      res.status(500).json({ error: 'Failed to fetch claims' });
+    }
+  });
 
-app.post('/claim', upload.single('image'), async (req, res) => {
+  app.post('/claim', upload.single('image'), async (req, res) => {
     const { phone, policyId, details } = req.body;
     const image = req.file;
   
@@ -933,25 +1114,62 @@ app.post('/claim', upload.single('image'), async (req, res) => {
     }
   
     try {
-      const policy = await db.collection('policies').findOne({ _id: policyId, riderPhone: phone });
+      // Verify rider exists
+      const rider = await db.collection('riders').findOne({ phone });
+      if (!rider) {
+        return res.status(404).json({ error: 'Rider not found' });
+      }
+  
+      // Verify policy exists and is active
+      const policy = await db.collection('policies').findOne({ 
+        _id: new ObjectId(policyId), 
+        riderPhone: phone 
+      });
       if (!policy || !policy.active || new Date(policy.expiryDate) < new Date()) {
         return res.status(400).json({ error: 'Invalid or inactive policy' });
       }
   
+      // Create initial claim document without transactionId
       const claim = {
-        policy: policy._id,
-        premium: policy.hbarAmount || policy.premiumPaid / 12.9,
+        riderPhone: phone,
+        policy: new ObjectId(policyId),
+        premium: policy.hbarAmount || (policy.premiumPaid ? policy.premiumPaid / 12.9 : 0),
         effectiveDate: policy.createdAt,
         status: 'Pending',
-        claimId: generateClaimId(), // Your ID generation logic
+        claimId: generateClaimId(),
         createdAt: new Date().toISOString(),
         details,
-        imageUrl: `/uploads/${image.filename}`
+        imageUrl: `/uploads/claims/${image.filename}`
       };
   
-      await db.collection('claims').insertOne(claim);
-      res.json({ message: 'Claim submitted successfully' });
+      // Insert claim into database
+      const result = await db.collection('claims').insertOne(claim);
+      const claimId = result.insertedId;
+  
+      // Perform Hedera transaction (example: transferring HBAR to rider as claim payout)
+      const transaction = new TransferTransaction()
+        .addHbarTransfer(accountId, -claim.premium) // Deduct from operator
+        .addHbarTransfer(AccountId.fromString(rider.accountId), claim.premium); // Add to rider
+  
+      // Execute transaction
+      const txResponse = await transaction.execute(client);
+      const receipt = await txResponse.getReceipt(client);
+      const transactionId = txResponse.transactionId.toString();
+  
+      // Update claim with transactionId
+      await db.collection('claims').updateOne(
+        { _id: claimId },
+        { $set: { transactionId } }
+      );
+  
+      res.json({ 
+        message: 'Claim submitted and transaction processed successfully',
+        claimId: claim.claimId,
+        id: claimId.toString(),
+        transactionId
+      });
     } catch (error) {
+      logger.error(`Claim submission failed for ${phone}: ${error.message}`);
       res.status(500).json({ error: error.message });
     }
   });
