@@ -449,43 +449,38 @@ app.post('/register', async (req, res) => {
         return res.status(400).json({ error: 'Phone already fully registered' });
       }
   
+      // Generate OTP
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
       
-      // Check if the phone number is NOT 0710865696
-      const formattedPhone = phone.replace('+254', '0'); // Convert to local format for comparison
-      if (formattedPhone !== '0710865696') {
-        // Store OTP in database but don't send via Twilio
-        await db.collection('otps').updateOne(
-          { phone },
-          { $set: { otp, createdAt: new Date() } },
-          { upsert: true }
-        );
-        
-        logger.info(`OTP generated for ${phone} (frontend notification)`);
-        return res.json({ 
-          message: 'OTP generated for frontend notification',
-          otp // Return OTP in response
-        });
-      }
-      
-      // For 0710865696, send via WhatsApp
-      await twilioClient.messages.create({
-        from: process.env.TWILIO_WHATSAPP_NUMBER,
-        to: `whatsapp:${phone}`,
-        body: `Your HashGuard OTP is ${otp}. Reply with this to verify.`,
-      });
-      
+      // Store OTP in database (always done)
       await db.collection('otps').updateOne(
         { phone },
         { $set: { otp, createdAt: new Date() } },
         { upsert: true }
       );
-  
-      logger.info(`OTP sent to ${phone}`);
-      res.json({ message: 'OTP sent to your WhatsApp' });
+      
+      // Attempt to send OTP via WhatsApp, but don’t fail the request if it errors
+      try {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_WHATSAPP_NUMBER,
+          to: `whatsapp:${phone}`,
+          body: `Your HashGuard OTP is ${otp}. Reply with this to verify.`,
+        });
+        logger.info(`OTP sent to ${phone} via WhatsApp`);
+      } catch (twilioError) {
+        logger.warn(`Failed to send OTP via WhatsApp to ${phone}: ${twilioError.message}`);
+        // Continue even if Twilio fails
+      }
+      
+      logger.info(`OTP generated for ${phone}`);
+      // Always return OTP in response, regardless of WhatsApp success
+      res.json({ 
+        message: 'OTP sent to your WhatsApp or use the code below',
+        otp // Always return OTP for Sonner
+      });
     } catch (error) {
       logger.error(`Registration failed for ${phone}: ${error.message}`);
-      res.status(500).json({ error: 'Failed to send OTP' });
+      res.status(500).json({ error: 'Failed to process registration' });
     }
 });
   
@@ -1415,6 +1410,13 @@ app.post('/login-otp', async (req, res) => {
         // Generate OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
         
+        // Send OTP via WhatsApp (existing behavior for all numbers)
+        await twilioClient.messages.create({
+            from: process.env.TWILIO_WHATSAPP_NUMBER,
+            to: `whatsapp:${phone}`,
+            body: `Your HashGuard Login OTP is ${otp}. Reply with this to verify.`,
+        });
+
         // Store OTP in database (existing behavior)
         await db.collection('otps').updateOne(
             { phone },
@@ -1422,30 +1424,14 @@ app.post('/login-otp', async (req, res) => {
             { upsert: true }
         );
 
-        // Check if the phone number is NOT 0710865696
-        const formattedPhone = phone.replace('+254', '0'); // Convert to local format for comparison
-        if (formattedPhone !== '0710865696') {
-            // Log the action (existing behavior)
-            logger.info(`Login OTP generated for ${phone} (frontend notification)`);
-            // Return OTP in response for frontend Sonner display
-            return res.json({ 
-                message: 'OTP generated for frontend notification',
-                otp // Added: Return OTP in response
-            });
-        }
-
-        // Existing behavior for 0710865696: Send OTP via WhatsApp
-        await twilioClient.messages.create({
-            from: process.env.TWILIO_WHATSAPP_NUMBER,
-            to: `whatsapp:${phone}`,
-            body: `Your HashGuard Login OTP is ${otp}. Reply with this to verify.`,
-        });
-
         // Log the action (existing behavior)
         logger.info(`Login OTP sent to ${phone}`);
 
-        // Existing response for 0710865696
-        res.json({ message: 'OTP sent to your WhatsApp' });
+        // Updated response: Include OTP for frontend display
+        res.json({ 
+            message: 'OTP sent to your WhatsApp',
+            otp // Added: Return OTP in response for all numbers
+        });
     } catch (error) {
         logger.error(`Login OTP failed for ${phone}: ${error.message}`);
         res.status(500).json({ error: 'Failed to send OTP' });
