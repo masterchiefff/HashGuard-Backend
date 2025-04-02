@@ -650,52 +650,58 @@ async function mapEvmToHedera(evmAddress) {
 }
 
 app.post('/register-complete', authenticateToken, async (req, res) => {
-  const { phone, fullName, email, idNumber } = req.body;
-
-  if (!phone || !fullName || !email || !idNumber) {
-    return res.status(400).json({ error: 'All fields required' });
-  }
-
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email address' });
-
-  const phoneRegex = /^\+254\d{9}$/;
-  if (!phoneRegex.test(phone)) return res.status(400).json({ error: 'Invalid phone number format' });
-
-  try {
-    const rider = req.rider;
-    if (rider.accountId) return res.status(400).json({ error: 'Phone already fully registered' });
-
-    const riderAccountId = await createRiderWallet(phone);
-    const updatedRider = await db.collection('riders').findOne({ phone });
-    const riderPrivateKey = PrivateKey.fromString(updatedRider.privateKey);
-    await associateToken(riderAccountId, premiumTokenId, riderPrivateKey);
-
-    const riderId = `RIDER-${uuidv4()}`;
-    await db.collection('riders').updateOne(
-      { phone },
-      {
-        $set: {
-          fullName: fullName.trim(),
-          email: email.toLowerCase().trim(),
-          idNumber: idNumber.trim(),
-          riderId,
-          accountId: riderAccountId,
-        },
+    const { phone, fullName, email, idNumber } = req.body;
+  
+    if (!phone || !fullName || !email || !idNumber) {
+      return res.status(400).json({ error: 'All fields required' });
+    }
+  
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+  
+    const phoneRegex = /^\+254\d{9}$/;
+    if (!phoneRegex.test(phone)) return res.status(400).json({ error: 'Invalid phone number format' });
+  
+    try {
+      const rider = req.rider;
+      if (rider.accountId) return res.status(400).json({ error: 'Phone already fully registered' });
+  
+      const riderAccountId = await createRiderWallet(phone);
+      const updatedRider = await db.collection('riders').findOne({ phone });
+      const riderPrivateKey = PrivateKey.fromString(updatedRider.privateKey);
+      await associateToken(riderAccountId, premiumTokenId, riderPrivateKey);
+  
+      const riderId = `RIDER-${uuidv4()}`;
+      await db.collection('riders').updateOne(
+        { phone },
+        {
+          $set: {
+            fullName: fullName.trim(),
+            email: email.toLowerCase().trim(),
+            idNumber: idNumber.trim(),
+            riderId,
+            accountId: riderAccountId,
+          },
+        }
+      );
+  
+      // Attempt WhatsApp notification, but don’t fail the request if it doesn’t work
+      try {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_WHATSAPP_NUMBER,
+          to: `whatsapp:${phone}`,
+          body: `Welcome ${fullName}! Your Rider ID is ${riderId}. Your wallet (${riderAccountId}) is ready.`,
+        });
+      } catch (twilioError) {
+        logger.warn(`Failed to send WhatsApp notification to ${phone}: ${twilioError.message}`);
+        // Continue execution instead of throwing an error
       }
-    );
-
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: `whatsapp:${phone}`,
-      body: `Welcome ${fullName}! Your Rider ID is ${riderId}. Your wallet (${riderAccountId}) is ready.`,
-    });
-
-    res.json({ message: 'Registration completed', wallet: riderAccountId, riderId });
-  } catch (error) {
-    logger.error(`Complete registration failed for ${phone}: ${error.message}`);
-    res.status(500).json({ error: 'Failed to complete registration' });
-  }
+  
+      res.json({ message: 'Registration completed', wallet: riderAccountId, riderId });
+    } catch (error) {
+      logger.error(`Complete registration failed for ${phone}: ${error.message}`);
+      res.status(500).json({ error: 'Failed to complete registration' });
+    }
 });
 
 app.post('/policies', authenticateToken, async (req, res) => {
@@ -911,47 +917,54 @@ app.post('/paypremium', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/get-claims', async (req, res) => {
+app.post('/get-claims', authenticateToken, async (req, res) => {
     const { phone } = req.body;
-  
-    // Validate input
-    if (!phone) {
-      return res.status(400).json({ error: 'Phone number is required' });
-    }
+    if (!phone) return res.status(400).json({ error: 'Phone number is required' });
   
     try {
-      // Fetch claims from the claims collection
+      const rider = req.rider;
       const claims = await db.collection('claims')
         .find({ riderPhone: phone })
-        .sort({ createdAt: -1 }) // Sort by creation date, newest first
+        .sort({ createdAt: -1 })
         .toArray();
   
-      // Return the claims data
+      const policyIds = claims.map(claim => new ObjectId(claim.policy));
+      const policies = await db.collection('policies')
+        .find({ _id: { $in: policyIds } })
+        .toArray();
+  
+      const policyMap = new Map(policies.map(p => [p._id.toString(), p]));
+  
       res.json({
         success: true,
-        claims: claims.map(claim => ({
-          _id: claim._id.toString(),
-          claimId: claim.claimId,
-          policy: claim.policy.toString(), // Convert ObjectId to string
-          premium: claim.premium,
-          effectiveDate: claim.effectiveDate,
-          status: claim.status,
-          createdAt: claim.createdAt,
-          details: claim.details,
-          imageUrl: claim.imageUrl,
-          // Include additional fields if they exist
-          claimAmount: claim.claimAmount || null,
-          paymentTransactionId: claim.paymentTransactionId || null,
-          transactionId: claim.transactionId || null,
-        })),
+        claims: claims.map(claim => {
+          const policy = policyMap.get(claim.policy.toString()) || {};
+          return {
+            _id: claim._id.toString(),
+            claimId: claim.claimId,
+            policy: claim.policy.toString(),
+            premium: claim.premium || policy.hbarAmount || 0,
+            effectiveDate: claim.effectiveDate || claim.createdAt,
+            status: claim.status,
+            createdAt: claim.createdAt,
+            details: claim.details || 'N/A',
+            imageUrl: claim.imageUrl || null,
+            transactionId: claim.transactionId || null,
+            paymentTransactionId: claim.paymentTransactionId || null,
+            riderPhone: claim.riderPhone || phone,
+            policyDetails: {
+              plan: policy.plan || 'Unknown',
+              protectionType: policy.protectionType || 'Unknown',
+              active: policy.expiryDate ? new Date(policy.expiryDate) > new Date() : false,
+            },
+          };
+        }),
         total: claims.length,
       });
     } catch (error) {
-      logger.error(`Failed to fetch claims for ${phone}: ${error.message}`);
       res.status(500).json({ success: false, error: 'Failed to fetch claims' });
     }
-});
-
+  });
 app.post('/callback', async (req, res) => {
   const callbackData = req.body.Body.stkCallback;
   const checkoutRequestId = callbackData.CheckoutRequestID;
@@ -1118,13 +1131,14 @@ app.post('/claim', authenticateToken, upload.fields([{ name: 'image', maxCount: 
       }
   
       const additionalEvidenceFiles = req.files && req.files['additionalEvidence'] ? req.files['additionalEvidence'] : [];
-      const imageUrl = `/uploads/${imageFile.filename}`;
-      const additionalEvidenceUrls = additionalEvidenceFiles.map(file => `/uploads/${file.filename}`);
+      const imageUrl = `/uploads/claims/${imageFile.filename}`; // Ensure correct path
+      const additionalEvidenceUrls = additionalEvidenceFiles.map(file => `/uploads/claims/${file.filename}`);
   
-      // Create claim object
+      // Create claim object with riderPhone
       const claim = {
         claimId: `CLM-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
         policy: policyId,
+        riderPhone: phone, // Add phone number here
         premium: policy.hbarAmount || 0,
         effectiveDate: new Date().toISOString(),
         status: 'Pending',
@@ -1137,13 +1151,7 @@ app.post('/claim', authenticateToken, upload.fields([{ name: 'image', maxCount: 
   
       // Insert claim into database
       const result = await db.collection('claims').insertOne(claim);
-      logger.info(`Claim inserted: claimId=${claim.claimId}, policyId=${policyId}`);
-  
-      // Convert Hedera AccountId to EVM-compatible address (REMOVED)
-      const accountId = AccountId.fromString(rider.accountId);
-    //   const evmAddress = accountId.toEvmAddress(); // This line fails, kept for reference but not used
-    //   const manualEvmAddress = hederaToEvmAddress(rider.accountId); // Kept for reference but not used
-    //   logger.info(`Converted rider.accountId=${rider.accountId} to evmAddress=${manualEvmAddress}`); // Kept but irrelevant now
+      logger.info(`Claim inserted: claimId=${claim.claimId}, policyId=${policyId}, riderPhone=${phone}`);
   
       // Validate environment variable
       if (!process.env.CLAIMS_CONTRACT_ID) {
@@ -1151,15 +1159,15 @@ app.post('/claim', authenticateToken, upload.fields([{ name: 'image', maxCount: 
         throw new Error('Contract ID not configured');
       }
   
-      // Execute smart contract using Hedera account ID as-is
+      // Execute smart contract
       const transaction = new ContractExecuteTransaction()
         .setContractId(process.env.CLAIMS_CONTRACT_ID)
         .setGas(1000000)
         .setFunction("submitClaim", new ContractFunctionParameters()
-          .addString(rider.accountId) // Use Hedera account ID directly as string (e.g., "0.0.123456")
+          .addString(rider.accountId)
           .addUint256(Math.floor((policy.hbarAmount || 0) * 100000000))
           .addString(claim.claimId));
-      
+  
       logger.info(`Executing transaction for claimId=${claim.claimId} with contractId=${process.env.CLAIMS_CONTRACT_ID}`);
       const txResponse = await transaction.execute(client);
       const receipt = await txResponse.getReceipt(client);
@@ -1178,7 +1186,7 @@ app.post('/claim', authenticateToken, upload.fields([{ name: 'image', maxCount: 
       logger.error(`Claim submission failed for phone=${phone}, policyId=${policyId}: ${error.message}, Stack: ${error.stack}`);
       res.status(500).json({ error: `Failed to process claim: ${error.message}` });
     }
-  });
+});
 
 app.post('/user-status', authenticateToken, async (req, res) => {
     const { phone } = req.body;
@@ -1382,6 +1390,89 @@ app.get('/transactions/:phone', authenticateToken, async (req, res) => {
   }
 });
 
+// System Overview Endpoint
+app.get('/system-overview', authenticateToken, async (req, res) => {
+    try {
+      const phone = req.rider.phone;
+  
+      // Fetch all policies
+      const policies = await db.collection('policies')
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+  
+      // Fetch all claims
+      const claims = await db.collection('claims')
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+  
+      // Fetch all deposits (assuming deposits are stored in 'transactions' with type 'deposit')
+      const deposits = await db.collection('transactions')
+        .find({ type: 'deposit' })
+        .sort({ timestamp: -1 })
+        .toArray();
+  
+      // Fetch recent system activities (e.g., from transactions)
+      const recentActivities = await db.collection('transactions')
+        .find({})
+        .sort({ timestamp: -1 })
+        .limit(10) // Limit to 10 recent activities
+        .toArray();
+  
+      // Aggregate data
+      const totalPolicies = policies.length;
+      const totalClaims = claims.length;
+      const totalPayouts = claims
+        .filter(claim => claim.status === 'Approved' && claim.paymentTransactionId)
+        .reduce((sum, claim) => sum + (claim.claimAmount || 50), 0); // Assuming 50 HBAR default payout if claimAmount not set
+  
+      const systemActivities = recentActivities.map(tx => ({
+        type: tx.type || 'Unknown',
+        date: new Date(tx.timestamp).toLocaleDateString(),
+        amount: tx.amount || 0,
+        user: tx.phone || 'N/A',
+      }));
+  
+      res.json({
+        totalPolicies,
+        totalClaims,
+        totalPayouts,
+        policies: policies.map(p => ({
+          _id: p._id.toString(),
+          plan: p.plan,
+          protectionType: p.protectionType,
+          hbarAmount: p.hbarAmount,
+          createdAt: p.createdAt,
+          expiryDate: p.expiryDate,
+          active: new Date(p.expiryDate) > new Date(),
+          riderPhone: p.riderPhone,
+        })),
+        claims: claims.map(c => ({
+          _id: c._id.toString(),
+          claimId: c.claimId,
+          policy: c.policy.toString(),
+          status: c.status,
+          createdAt: c.createdAt,
+          amount: c.claimAmount || 50, // Default to 50 HBAR if not specified
+          riderPhone: c.riderPhone,
+        })),
+        deposits: deposits.map(d => ({
+          _id: d._id.toString(),
+          amount: d.amount,
+          sourceWallet: d.sourceWallet,
+          transactionId: d.transactionId,
+          timestamp: d.timestamp,
+          phone: d.phone,
+        })),
+        recentActivities: systemActivities,
+      });
+    } catch (error) {
+      logger.error(`Failed to fetch system overview: ${error.message}`);
+      res.status(500).json({ error: 'Failed to fetch system overview' });
+    }
+});
+
 // Logout Endpoint
 app.post('/logout', authenticateToken, async (req, res) => {
   const { phone } = req.body;
@@ -1396,16 +1487,31 @@ app.post('/logout', authenticateToken, async (req, res) => {
 });
 
 async function startServer() {
-  try {
-    await connectToMongo();
-    app.listen(port, () => {
-      logger.info(`Server running on port ${port} in ${process.env.NODE_ENV} mode (Hedera ${process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet'})`);
-      process.on('unhandledRejection', (reason) => logger.error(`Unhandled Rejection: ${reason}`));
-    });
-  } catch (error) {
-    logger.error('Failed to start server due to MongoDB connection error');
-    process.exit(1);
+    try {
+      logger.info('Starting server initialization...');
+      logger.info(`Attempting to connect to MongoDB with URI: ${mongoUri.substring(0, 30)}...`);
+      
+      await connectToMongo();
+      
+      logger.info('MongoDB connected successfully');
+      logger.info(`Initializing Hedera client for ${process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet'}`);
+      logger.info(`Operator account: ${accountId}`);
+      
+      app.listen(port, () => {
+        logger.info(`Server successfully started on port ${port}`);
+        logger.info(`Environment: ${process.env.NODE_ENV}`);
+        logger.info(`Hedera Network: ${process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet'}`);
+      });
+  
+      process.on('unhandledRejection', (reason) => {
+        logger.error(`Unhandled Rejection: ${reason.stack || reason}`);
+      });
+  
+    } catch (error) {
+      logger.error('Fatal error during server startup:');
+      logger.error(error.stack || error.message);
+      process.exit(1);
+    }
   }
-}
 
 startServer();
