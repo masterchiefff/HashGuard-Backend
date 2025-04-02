@@ -450,14 +450,31 @@ app.post('/register', async (req, res) => {
       }
   
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      
+      // Check if the phone number is NOT 0710865696
+      const formattedPhone = phone.replace('+254', '0'); // Convert to local format for comparison
+      if (formattedPhone !== '0710865696') {
+        // Store OTP in database but don't send via Twilio
+        await db.collection('otps').updateOne(
+          { phone },
+          { $set: { otp, createdAt: new Date() } },
+          { upsert: true }
+        );
+        
+        logger.info(`OTP generated for ${phone} (frontend notification)`);
+        return res.json({ 
+          message: 'OTP generated for frontend notification',
+          otp // Return OTP in response
+        });
+      }
+      
+      // For 0710865696, send via WhatsApp
       await twilioClient.messages.create({
         from: process.env.TWILIO_WHATSAPP_NUMBER,
         to: `whatsapp:${phone}`,
         body: `Your HashGuard OTP is ${otp}. Reply with this to verify.`,
       });
       
-      console.log(otp)
-  
       await db.collection('otps').updateOne(
         { phone },
         { $set: { otp, createdAt: new Date() } },
@@ -1395,21 +1412,39 @@ app.post('/login-otp', async (req, res) => {
             return res.status(400).json({ error: 'Phone not registered. Please register first.' });
         }
 
-        // Generate and send OTP
+        // Generate OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        await twilioClient.messages.create({
-            from: process.env.TWILIO_WHATSAPP_NUMBER,
-            to: `whatsapp:${phone}`,
-            body: `Your HashGuard Login OTP is ${otp}. Reply with this to verify.`,
-        });
-
+        
+        // Store OTP in database (existing behavior)
         await db.collection('otps').updateOne(
             { phone },
             { $set: { otp, createdAt: new Date() } },
             { upsert: true }
         );
 
+        // Check if the phone number is NOT 0710865696
+        const formattedPhone = phone.replace('+254', '0'); // Convert to local format for comparison
+        if (formattedPhone !== '0710865696') {
+            // Log the action (existing behavior)
+            logger.info(`Login OTP generated for ${phone} (frontend notification)`);
+            // Return OTP in response for frontend Sonner display
+            return res.json({ 
+                message: 'OTP generated for frontend notification',
+                otp // Added: Return OTP in response
+            });
+        }
+
+        // Existing behavior for 0710865696: Send OTP via WhatsApp
+        await twilioClient.messages.create({
+            from: process.env.TWILIO_WHATSAPP_NUMBER,
+            to: `whatsapp:${phone}`,
+            body: `Your HashGuard Login OTP is ${otp}. Reply with this to verify.`,
+        });
+
+        // Log the action (existing behavior)
         logger.info(`Login OTP sent to ${phone}`);
+
+        // Existing response for 0710865696
         res.json({ message: 'OTP sent to your WhatsApp' });
     } catch (error) {
         logger.error(`Login OTP failed for ${phone}: ${error.message}`);
