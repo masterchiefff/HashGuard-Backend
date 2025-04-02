@@ -97,7 +97,7 @@ const pendingPayments = new Map(); // checkoutRequestId -> { phone, amountKsh }
 
 // Middleware
 app.use(cors({
-    origin: ['http://localhost:3000', 'https://hash-guard.vercel.app/'],
+    origin: '*',
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type'],
 }));
