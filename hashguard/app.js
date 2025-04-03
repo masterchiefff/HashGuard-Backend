@@ -50,6 +50,9 @@ const client = (process.env.NODE_ENV === 'production' ? Client.forTestnet() : Cl
   .setMaxAttempts(3)
   .setRequestTimeout(10000);
 
+
+console.log(process.env.NODE_ENV);
+
 logger.info(`Client initialized with operator: ${accountId}`);
 if (!accountId || !accountId.startsWith('0.0.')) {
   throw new Error(`Invalid HEDERA_ACCOUNT_ID: ${accountId}`);
