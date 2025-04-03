@@ -45,7 +45,7 @@ for (const env of requiredEnv) {
 // Initialize core services
 const accountId = process.env.HEDERA_ACCOUNT_ID;
 const privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
-const client = (process.env.NODE_ENV === 'development' ? Client.forTestnet() : Client.forTestnet())
+const client = Client.forTestnet()  // Always use Testnet
   .setOperator(accountId, privateKey)
   .setMaxAttempts(3)
   .setRequestTimeout(10000);
@@ -1514,13 +1514,13 @@ async function startServer() {
       await connectToMongo();
       
       logger.info('MongoDB connected successfully');
-      logger.info(`Initializing Hedera client for ${process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet'}`);
+      logger.info('Initializing Hedera client for Testnet (forced for all environments)');
       logger.info(`Operator account: ${accountId}`);
       
       app.listen(port, () => {
         logger.info(`Server successfully started on port ${port}`);
         logger.info(`Environment: ${process.env.NODE_ENV}`);
-        logger.info(`Hedera Network: ${process.env.NODE_ENV === 'production' ? 'Mainnet' : 'Testnet'}`);
+        logger.info('Hedera Network: Testnet (forced)');
       });
   
       process.on('unhandledRejection', (reason) => {
@@ -1532,6 +1532,6 @@ async function startServer() {
       logger.error(error.stack || error.message);
       process.exit(1);
     }
-  }
+}
 
 startServer();
