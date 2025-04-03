@@ -45,7 +45,7 @@ for (const env of requiredEnv) {
 // Initialize core services
 const accountId = process.env.HEDERA_ACCOUNT_ID;
 const privateKey = PrivateKey.fromString(process.env.HEDERA_PRIVATE_KEY);
-const client = (process.env.NODE_ENV === 'production' ? Client.forMainnet() : Client.forTestnet())
+const client = (process.env.NODE_ENV === 'production' ? Client.forTestnet() : Client.forTestnet())
   .setOperator(accountId, privateKey)
   .setMaxAttempts(3)
   .setRequestTimeout(10000);
