@@ -1249,40 +1249,57 @@ app.post('/overview', authenticateToken, async (req, res) => {
       const walletBalance = balance.hbars.toBigNumber().toNumber();
       const hptBalance = balance.tokens.get(process.env.PREMIUM_TOKEN_ID)?.toNumber() || 0;
   
-      const policies = await db.collection('policies').find({ phone }).toArray();
+      // Fetch and map policies
+      const policies = await db.collection('policies').find({ riderPhone: phone }).toArray();
       let policyActive = false;
       let nextPaymentDue = 'N/A';
       let nextBill = 0;
   
       if (policies.length > 0) {
         const activePolicy = policies[0];
-        policyActive = new Date(activePolicy.expiryDate) > new Date();
-        const expiryDate = typeof activePolicy.expiryDate === 'string' || typeof activePolicy.expiryDate === 'number'
-          ? new Date(activePolicy.expiryDate)
-          : new Date();
+        policyActive = activePolicy.active && new Date(activePolicy.expiryDate) > new Date();
+        const expiryDate = new Date(activePolicy.expiryDate);
         nextPaymentDue = expiryDate instanceof Date && !isNaN(expiryDate)
           ? expiryDate.toISOString().split('T')[0]
           : 'Invalid Date';
-        nextBill = activePolicy.nextBill || 1500;
+        nextBill = activePolicy.hbarAmount || 1500;
       }
   
-      const recentActivities = await db.collection('transactions')
+      const policyActivities = policies.map(policy => ({
+        type: 'Policy',
+        description: `${policy.plan} (${policy.protectionType})`,
+        amount: policy.hbarAmount || 0,
+        status: policy.active && new Date(policy.expiryDate) > new Date() ? 'Active' : 'Expired',
+        date: policy.createdAt || new Date().toISOString(),
+      }));
+  
+      // Fetch and map claims
+      const claims = await db.collection('claims').find({ riderPhone: phone }).toArray();
+      const claimActivities = claims.map(claim => ({
+        type: 'Claim',
+        description: claim.claimId || `Claim #${claim._id.toString().slice(-6)}`,
+        amount: claim.premium || 0,
+        status: claim.status || 'Pending',
+        date: claim.createdAt || claim.effectiveDate || new Date().toISOString(),
+      }));
+  
+      // Fetch and map transactions (deposits)
+      const transactions = await db.collection('transactions')
         .find({ phone })
         .sort({ timestamp: -1 })
-        .limit(5)
-        .toArray()
-        .then(transactions =>
-          transactions.map(tx => {
-            const timestamp = typeof tx.timestamp === 'string' || tx.timestamp instanceof Date
-              ? new Date(tx.timestamp)
-              : new Date();
-            return {
-              type: tx.type || 'Unknown',
-              date: timestamp.toLocaleDateString(),
-              amount: tx.amount || 0,
-            };
-          })
-        );
+        .toArray();
+      const transactionActivities = transactions.map(tx => ({
+        type: tx.type || 'Deposit',
+        description: tx.description || `${tx.type || 'Deposit'} #${tx._id.toString().slice(-6)}`,
+        amount: tx.amount || 0,
+        status: tx.status || 'Completed',
+        date: tx.timestamp || new Date().toISOString(),
+      }));
+  
+      // Combine and sort all activities by date (newest first)
+      const activities = [...policyActivities, ...claimActivities, ...transactionActivities]
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+        .slice(0, 10); // Limit to 10 entries
   
       const overviewData = {
         riderId: riderData.riderId || 'N/A',
@@ -1295,7 +1312,7 @@ app.post('/overview', authenticateToken, async (req, res) => {
         nextBill,
         walletBalance,
         hptBalance,
-        recentActivities,
+        activities,
       };
   
       console.log('overviewData:', JSON.stringify(overviewData, null, 2)); // Debug log
@@ -1304,7 +1321,7 @@ app.post('/overview', authenticateToken, async (req, res) => {
       logger.error(`Failed to fetch overview for ${phone}: ${error.message}`);
       res.status(500).json({ error: `Failed to fetch overview: ${error.message}` });
     }
-  });
+});
 
 app.post('/token-balance', authenticateToken, async (req, res) => {
   const { phone } = req.body;
